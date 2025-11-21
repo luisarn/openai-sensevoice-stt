@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  sensevoice-stt:
+    build: .
+    container_name: sensevoice-stt
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/root/.cache/modelscope/hub
+    restart: unless-stopped
+    command: [ "uv", "run", "funasr_http_server.py", "--host", "0.0.0.0", "--port", "8000" ]

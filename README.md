@@ -1,6 +1,7 @@
 # OpenAI API Compatible SenseVoice STT API
 
 Offline speech recognition service based on SenseVoice, providing OpenAI Whisper API compatible HTTP endpoints.
+Modified based on [FunASR HTTP Server](https://github.com/modelscope/FunASR/tree/main/runtime/python/http)
 
 ## Features
 
@@ -37,6 +38,104 @@ uv run funasr_http_server.py \
   --merge_vad True \
   --merge_length_s 15
 ```
+
+### Docker Deployment
+
+#### Build Docker Image
+
+```bash
+docker build -t sensevoice-stt:latest .
+```
+
+#### Run with Model Auto-Download
+
+Run the container with a volume mount for model persistence. The model will be automatically downloaded from ModelScope to the mounted volume on first run:
+
+```bash
+# Create models directory (if not exists)
+mkdir -p ./models
+
+# Run container with model volume mount
+docker run -d \
+  --name sensevoice-stt \
+  -p 8000:8000 \
+  -v $PWD/models:/root/.cache/modelscope/hub \
+  sensevoice-stt:latest
+```
+
+**Note:** 
+- The model will download to `./models/iic/SenseVoiceSmall/` on first run
+- If you already have the model, place it at `./models/iic/SenseVoiceSmall/` before running
+
+**Directory Structure:**
+```
+./models/
+└── iic/
+    └── SenseVoiceSmall/
+        ├── configuration.json
+        ├── model.pt
+        └── ...
+```
+
+#### Run with Local Model
+
+If you already have the model downloaded locally:
+
+```bash
+docker run -d \
+  --name sensevoice-stt \
+  -p 8000:8000 \
+  -v /path/to/your/models:/root/.cache/modelscope/hub \
+  sensevoice-stt:latest
+```
+
+**Note:** Your local model should be at `/path/to/your/models/iic/SenseVoiceSmall/`.
+
+#### Run with Custom Parameters
+
+```bash
+docker run -d \
+  --name sensevoice-stt \
+  -p 8000:8000 \
+  -v $PWD/models:/root/.cache/modelscope/hub \
+  sensevoice-stt:latest \
+  uv run funasr_http_server.py --language zh --device cpu
+```
+
+#### View Container Logs
+
+```bash
+docker logs -f sensevoice-stt
+```
+
+#### Stop and Remove Container
+
+```bash
+docker stop sensevoice-stt
+docker rm sensevoice-stt
+```
+
+#### Using Docker Compose
+
+For easier deployment, you can use Docker Compose:
+
+```bash
+# Start service
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop service
+docker-compose down
+```
+
+The `docker-compose.yml` configuration:
+- Automatically builds the image
+- Mounts `./models` to ModelScope's cache directory
+- Models download to `./models/iic/SenseVoiceSmall/`
+- Exposes port 8000
+- Restarts automatically unless stopped
 
 ### Available Parameters
 

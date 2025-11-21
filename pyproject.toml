@@ -1,0 +1,22 @@
+[project]
+name = "openai-sensevoice-stt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "fastapi>=0.95.1",
+    "ffmpeg-python>=0.2.0",
+    "funasr>=1.0.5",
+    "funasr-onnx>=0.4.1",
+    "modelscope>=1.11.1",
+    "onnxscript>=0.5.0",
+    "python-multipart>=0.0.20",
+    "requests>=2.32.5",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
+    "uvicorn>=0.38.0",
+    "websockets>=15.0.1",
+]

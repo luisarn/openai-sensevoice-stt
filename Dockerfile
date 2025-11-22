@@ -29,7 +29,7 @@ RUN uv sync
 RUN mkdir -p /root/.cache/modelscope/hub /workspace/temp_dir
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8200
 
 # Run the server
-CMD ["uv", "run", "funasr_http_server.py", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "funasr_http_server.py", "--host", "0.0.0.0", "--port", "8200"]

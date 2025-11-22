@@ -18,6 +18,23 @@ Modified based on [FunASR HTTP Server](https://github.com/modelscope/FunASR/tree
 uv sync
 ```
 
+### CUDA Support
+
+If you want to accelerate the inference using your GPU with CUDA support, modify the `pyproject.toml` by adding the following lines to it.
+Adjust the CUDA version according to your GPU. You may also need to adjust the `torch`, `torchvision`, `torchaudio` versions.
+
+```
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+```
+
 ## Deployment
 
 ### Basic Startup

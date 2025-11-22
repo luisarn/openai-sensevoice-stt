@@ -7,6 +7,7 @@ from typing import Optional
 
 import aiofiles
 import ffmpeg
+import torch  # Added for MPS/CUDA detection
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import Response
@@ -47,7 +48,12 @@ parser.add_argument(
     default=30000,
     help="max_single_segment_time for VAD in milliseconds",
 )
-parser.add_argument("--device", type=str, default="cpu", help="cuda or cpu")
+parser.add_argument(
+    "--device",
+    type=str,
+    default="auto",
+    help="Device to use: 'cuda', 'cpu', 'mps', or 'auto' (default: auto)",
+)
 parser.add_argument("--ncpu", type=int, default=4, help="cpu cores")
 parser.add_argument(
     "--language",
@@ -77,15 +83,35 @@ parser.add_argument("--certfile", type=str, default=None, required=False, help="
 parser.add_argument("--keyfile", type=str, default=None, required=False, help="keyfile for ssl")
 parser.add_argument("--temp_dir", type=str, default="temp_dir/", required=False, help="temp dir")
 args = parser.parse_args()
+
+# Resolve device
+if args.device == "auto":
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+else:
+    device = args.device
+
+# Validate MPS availability
+if device == "mps" and not torch.backends.mps.is_available():
+    logger.warning("MPS requested but not available. Falling back to CPU.")
+    device = "cpu"
+
 logger.info("-----------  Configuration Arguments -----------")
 for arg, value in vars(args).items():
-    logger.info("%s: %s" % (arg, value))
+    if arg == "device":
+        logger.info(f"device: {device} (requested: {args.device})")
+    else:
+        logger.info("%s: %s" % (arg, value))
 logger.info("------------------------------------------------")
 
 os.makedirs(args.temp_dir, exist_ok=True)
 
 logger.info("model loading")
-# load SenseVoice model
+# Load SenseVoice model
 model_dir = args.model_dir
 model = AutoModel(
     model=model_dir,
@@ -93,7 +119,7 @@ model = AutoModel(
     remote_code=args.remote_code,
     vad_model=args.vad_model,
     vad_kwargs={"max_single_segment_time": args.vad_kwargs},
-    device=args.device,
+    device=device,
     ncpu=args.ncpu,
     disable_pbar=True,
     disable_log=True,
@@ -154,15 +180,6 @@ def format_transcription_response(
 ):
     """
     將辨識結果格式化為指定的回應格式
-    
-    Args:
-        text: 辨識文本
-        response_format: 回應格式 (json, text, verbose_json, srt, vtt)
-        duration: 音頻時長（秒）
-        language: 檢測到的語言
-    
-    Returns:
-        格式化後的回應
     """
     if response_format == "text":
         return text
@@ -180,9 +197,7 @@ def format_transcription_response(
     elif response_format == "vtt":
         return format_vtt(text, duration)
     else:
-        # 預設返回 json
         return {"text": text}
-
 
 
 @app.post("/recognition")
@@ -202,25 +217,22 @@ async def api_recognition(audio: UploadFile = File(..., description="audio file"
         logger.error(f"读取音频文件发生错误，错误信息：{e}")
         return {"msg": "读取音频文件发生错误", "code": 1}
     rec_results = model.generate(input=audio_bytes, is_final=True, **param_dict)
-    
-    # 檢查結果
+
     if not rec_results or len(rec_results) == 0:
         return {"text": "", "code": 0}
-    
+
     rec_result = rec_results[0]
     if "text" not in rec_result or len(rec_result["text"]) == 0:
         return {"text": "", "code": 0}
-    
-    # 使用 rich_transcription_postprocess 處理結果
+
     text = rich_transcription_postprocess(rec_result["text"])
-    
-    # 簡化的回應格式
     ret = {"text": text, "code": 0}
     logger.info(f"識別結果：{ret}")
     return ret
 
 
 @app.post("/v1/audio/transcriptions")
+@app.post("/audio/transcriptions")  # Alias route
 async def openai_transcriptions(
     file: UploadFile = File(..., description="audio file"),
     model_name: str = Form(..., alias="model", description="model to use"),
@@ -231,19 +243,15 @@ async def openai_transcriptions(
 ):
     """
     OpenAI-compatible audio transcription endpoint
-    
-    Compatible with OpenAI's /v1/audio/transcriptions API
-    Supports response formats: json, text, verbose_json, srt, vtt
+    Also available at /audio/transcriptions (alias)
     """
-    # 儲存上傳的文件
     suffix = file.filename.split(".")[-1] if "." in file.filename else "wav"
     audio_path = f"{args.temp_dir}/{str(uuid.uuid1())}.{suffix}"
     async with aiofiles.open(audio_path, "wb") as out_file:
         content = await file.read()
         await out_file.write(content)
-    
+
     try:
-        # 使用 ffmpeg 轉換音頻
         audio_bytes, _ = (
             ffmpeg.input(audio_path, threads=0)
             .output("-", format="s16le", acodec="pcm_s16le", ac=1, ar=16000)
@@ -254,19 +262,17 @@ async def openai_transcriptions(
         if os.path.exists(audio_path):
             os.remove(audio_path)
         return {"error": {"message": "Audio file processing failed", "type": "invalid_request_error"}}
-    
-    # 準備推理參數
+
     inference_params = {
         "language": language or args.language,
         "use_itn": args.use_itn,
         "merge_vad": args.merge_vad,
         "merge_length_s": args.merge_length_s,
     }
-    
-    # 執行辨識
+
     try:
         rec_results = model.generate(input=audio_bytes, is_final=True, **inference_params)
-        
+
         if not rec_results or len(rec_results) == 0:
             if os.path.exists(audio_path):
                 os.remove(audio_path)
@@ -274,7 +280,7 @@ async def openai_transcriptions(
             if response_format in ["text", "srt", "vtt"]:
                 return Response(content=formatted_response, media_type="text/plain")
             return formatted_response
-        
+
         rec_result = rec_results[0]
         if "text" not in rec_result or len(rec_result["text"]) == 0:
             if os.path.exists(audio_path):
@@ -283,37 +289,32 @@ async def openai_transcriptions(
             if response_format in ["text", "srt", "vtt"]:
                 return Response(content=formatted_response, media_type="text/plain")
             return formatted_response
-        
-        # 後處理文本
+
         text = rich_transcription_postprocess(rec_result["text"])
-        
-        # 清理臨時文件
+
         if os.path.exists(audio_path):
             os.remove(audio_path)
-        
-        # 格式化回應
+
         formatted_response = format_transcription_response(
             text=text,
             response_format=response_format,
             language=language
         )
-        
+
         logger.info(f"OpenAI API 辨識結果：{text[:100]}...")
-        
-        # 根據回應格式設定 Content-Type
+
         if response_format == "text":
             return Response(content=formatted_response, media_type="text/plain")
         elif response_format in ["srt", "vtt"]:
             return Response(content=formatted_response, media_type="text/plain")
         else:
             return formatted_response
-            
+
     except Exception as e:
         logger.error(f"辨識過程發生錯誤：{e}")
         if os.path.exists(audio_path):
             os.remove(audio_path)
         return {"error": {"message": str(e), "type": "server_error"}}
-
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ Modified based on [FunASR HTTP Server](https://github.com/modelscope/FunASR/tree
 - ✅ **Auto Language Detection**: Supports `language=auto`
 - ✅ **VAD Segmentation**: Automatic voice activity detection and segment merging
 - ✅ **Inverse Text Normalization**: Supports number, date formatting in output
+- ✅ **High Performance**: Uses torchaudio for in-memory audio processing, eliminating disk I/O overhead, keep `ffmpeg` as fallback
 
 ## Installation
 

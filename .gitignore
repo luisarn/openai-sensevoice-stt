@@ -18,3 +18,5 @@ temp_dir
 server.log
 
 .env
+
+prompts

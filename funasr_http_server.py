@@ -65,9 +65,6 @@ def process_audio_bytes_torchaudio(audio_bytes: bytes) -> np.ndarray:
     
     return audio_array
 
-
-
-
 def process_audio_bytes_ffmpeg(audio_path: str) -> bytes:
     """
     使用 ffmpeg 處理音頻（備用方案）
@@ -84,6 +81,29 @@ def process_audio_bytes_ffmpeg(audio_path: str) -> bytes:
         .run(cmd=["ffmpeg", "-nostdin"], capture_stdout=True, capture_stderr=True)
     )
     return audio_bytes
+
+def llm_correction(text: str) -> str:
+    """
+    使用 LLM 進行文本校正
+    
+    Args:
+        text: 需要校正的文本
+    
+    Returns:
+        校正後的文本
+    """
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL"),
+            messages=[
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Error in llm_correction: {e}")
+        return text
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -143,6 +163,7 @@ parser.add_argument(
 parser.add_argument("--certfile", type=str, default=None, required=False, help="certfile for ssl")
 parser.add_argument("--keyfile", type=str, default=None, required=False, help="keyfile for ssl")
 parser.add_argument("--temp_dir", type=str, default="temp_dir/", required=False, help="temp dir")
+parser.add_argument("--llm_correct", action="store_true", help="enable llm correction")
 args = parser.parse_args()
 logger.info("-----------  Configuration Arguments -----------")
 for arg, value in vars(args).items():
@@ -166,6 +187,39 @@ model = AutoModel(
     disable_log=True,
 )
 logger.info("loaded models!")
+
+client = None
+LLM_SYSTEM_PROMPT = None
+if args.llm_correct:
+    from openai import OpenAI
+    from dotenv import load_dotenv
+    env_path = Path.cwd() / ".env"
+    load_dotenv(dotenv_path=env_path)
+    client = OpenAI(base_url=os.getenv("OPENAI_BASE_URL"), api_key=os.getenv("OPENAI_API_KEY"))
+    
+    # 讀取 LLM 系統提示
+    prompt_file = Path.cwd() / "prompts" / "llm_correction_system.txt"
+    try:
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            LLM_SYSTEM_PROMPT = f.read()
+        logger.info(f"已從 {prompt_file} 載入 LLM 系統提示")
+    except Exception as e:
+        logger.error(f"無法讀取 LLM 系統提示文件 {prompt_file}: {e}")
+        logger.error("將使用預設的系統提示")
+        LLM_SYSTEM_PROMPT = """
+You are an expert editor designed to post-process ASR (Automatic Speech Recognition) transcripts. 
+
+Your task is to correct the provided text while strictly adhering to the following rules:
+
+1. **Fix Errors:** Correct spelling, grammar, and punctuation mistakes.
+2. **Contextual Correction:** Fix obvious phonetic mistranscriptions (homophones) based on the context.
+3. **Formatting:** Restore proper capitalization for sentences and proper nouns.
+4. **Preserve Meaning:** Do NOT change the original meaning, tone, or style of the speaker. Do NOT summarize or hallucinate information.
+5. **Output Constraint:** Output ONLY the corrected text. Do not include any conversational fillers, introductions, or explanations (e.g., do not say "Here is the corrected text").
+6. **Language:** Follow the original language of the transcript.
+        """
+    
+    logger.info("2 Pass mode enable!")
 
 app = FastAPI(title="FunASR")
 
@@ -306,7 +360,7 @@ async def api_recognition(audio: UploadFile = File(..., description="audio file"
 @app.post("/v1/audio/transcriptions")
 async def openai_transcriptions(
     file: UploadFile = File(..., description="audio file"),
-    model_name: str = Form(..., alias="model", description="model to use"),
+    model_name: Optional[str] = Form("sensevoice", alias="model", description="model to use"),
     language: Optional[str] = Form(None, description="language code (ISO-639-1)"),
     prompt: Optional[str] = Form(None, description="optional prompt"),
     response_format: Optional[str] = Form("json", description="response format"),
@@ -374,6 +428,8 @@ async def openai_transcriptions(
         
         # 後處理文本
         text = rich_transcription_postprocess(rec_result["text"])
+        if args.llm_correct:
+            text = llm_correction(text)
         
         # 格式化回應
         formatted_response = format_transcription_response(
@@ -395,9 +451,6 @@ async def openai_transcriptions(
     except Exception as e:
         logger.error(f"辨識過程發生錯誤：{e}")
         return {"error": {"message": str(e), "type": "server_error"}}
-
-
-
 
 if __name__ == "__main__":
     uvicorn.run(

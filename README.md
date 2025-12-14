@@ -11,6 +11,8 @@ Modified based on [FunASR HTTP Server](https://github.com/modelscope/FunASR/tree
 - ✅ **Auto Language Detection**: Supports `language=auto`
 - ✅ **VAD Segmentation**: Automatic voice activity detection and segment merging
 - ✅ **Inverse Text Normalization**: Supports number, date formatting in output
+- ✅ **High Performance**: Uses `soundfile` + `torchaudio` for in-memory audio processing, eliminating disk I/O overhead
+- ✅ **LLM Post-Processing**: Optional 2-pass mode with LLM-based transcript correction for improved accuracy 
 
 ## Installation
 
@@ -43,6 +45,12 @@ torchaudio = { index = "pytorch" }
 uv run funasr_http_server.py --port 8200 --device cpu
 ```
 
+### Run in background
+
+```bash
+nohup uv run funasr_http_server.py --port 8000 --device mps > server.log 2>&1 &
+```
+
 ### Custom Configuration
 
 ```bash
@@ -55,6 +63,35 @@ uv run funasr_http_server.py \
   --merge_vad True \
   --merge_length_s 15
 ```
+
+### LLM Post-Processing (2-Pass Mode)
+
+Enable optional LLM-based transcript correction for improved accuracy:
+
+```bash
+uv run funasr_http_server.py --port 8000 --device cpu --llm_correct
+```
+
+**Configuration:**
+
+1. Create a `.env` file in the project root:
+```bash
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=your_api_key_here
+OPENAI_MODEL=gpt-4o-mini
+```
+
+2. (Optional) Customize the system prompt by creating `prompts/llm_correction_system.txt`:
+```
+You are an expert editor designed to post-process ASR transcripts.
+Your task is to correct spelling, grammar, and punctuation...
+```
+
+**Notes:**
+- If `prompts/llm_correction_system.txt` exists, it will be used as the system prompt
+- Otherwise, a sensible default prompt is used
+- Works with OpenAI-compatible APIs (OpenAI, Azure, local LLMs, etc.)
+- The LLM correction applies to the `/v1/audio/transcriptions` endpoint
 
 ### Docker Deployment
 
@@ -170,6 +207,7 @@ The `docker-compose.yml` configuration:
 | `--use_itn` | bool | `True` | Use inverse text normalization |
 | `--merge_vad` | bool | `True` | Merge VAD segments |
 | `--merge_length_s` | int | `15` | VAD merge max length (seconds) |
+| `--llm_correct` | flag | `False` | Enable LLM-based transcript post-processing (requires `.env` config) |
 
 ## Usage
 
@@ -361,6 +399,18 @@ Legacy endpoint, maintains backward compatibility.
 | Japanese | `ja` | ✅ |
 | Korean | `ko` | ✅ |
 
+## Performance Benchmarks
+
+You can benchmark the server using the included `test_speed.py`:
+
+```bash
+# Start the server
+uv run funasr_http_server.py --port 8000 --device cuda  # or --device mps for Mac
+
+# In another terminal, run the speed test
+python test_speed.py audio/your_audio.wav --runs 10
+```
+
 ## Troubleshooting
 
 ### Port Already in Use
@@ -383,9 +433,20 @@ models/iic/SenseVoiceSmall/
 └── ...
 ```
 
+### Audio Processing Falls Back to ffmpeg
+
+If you see warnings like `"torchaudio 處理失敗...回退到 ffmpeg"` in the logs:
+
+1. **Normal behavior**: The server tries `soundfile` first, then falls back to `ffmpeg` for unsupported formats
+2. **Performance impact**: Fallback is slightly slower but still works correctly
+3. **Solution**: Ensure `soundfile` is installed via `uv sync`
+
+Most common audio formats (WAV, MP3, FLAC, OGG) are supported by `soundfile` and won't trigger fallback.
+
 ### ffmpeg Error
 
-Ensure ffmpeg is installed:
+The server keeps `ffmpeg` as a fallback for rare audio formats. Ensure ffmpeg is installed:
+
 ```bash
 # macOS
 brew install ffmpeg

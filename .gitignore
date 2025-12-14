@@ -15,3 +15,8 @@ temp
 temp_dir
 
 .DS_Store
+server.log
+
+.env
+
+prompts

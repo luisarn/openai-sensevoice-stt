@@ -1,4 +1,5 @@
 import argparse
+import io
 import logging
 import os
 import uuid
@@ -7,7 +8,10 @@ from typing import Optional
 
 import aiofiles
 import ffmpeg
-import torch  # Added for MPS/CUDA detection
+import numpy as np
+import soundfile as sf
+import torch
+import torchaudio
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import Response
@@ -18,6 +22,88 @@ from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
 logger = get_logger(log_level=logging.INFO)
 logger.setLevel(logging.INFO)
+
+
+def process_audio_bytes_torchaudio(audio_bytes: bytes) -> np.ndarray:
+    """
+    使用 soundfile 在記憶體中處理音頻，無需臨時文件
+    
+    Args:
+        audio_bytes: 原始音頻文件的 bytes
+    
+    Returns:
+        numpy array of audio samples (16kHz, mono, float32)
+    """
+    # 從 bytes 加載音頻，使用 soundfile
+    audio_buffer = io.BytesIO(audio_bytes)
+    
+    # 使用 soundfile 讀取音頻
+    waveform, sample_rate = sf.read(audio_buffer, dtype='float32')
+    
+    # soundfile 返回的是 (samples, channels) 格式，需要轉置為 (channels, samples)
+    if waveform.ndim == 1:
+        # 單聲道
+        waveform = waveform[np.newaxis, :]  # 添加 channel 維度
+    else:
+        # 多聲道，轉置
+        waveform = waveform.T
+    
+    # 轉換為 torch tensor 以便處理
+    waveform_tensor = torch.from_numpy(waveform)
+    
+    # 轉換為單聲道（如果是多聲道）
+    if waveform_tensor.shape[0] > 1:
+        waveform_tensor = torch.mean(waveform_tensor, dim=0, keepdim=True)
+    
+    # 重採樣到 16kHz（如果需要）
+    if sample_rate != 16000:
+        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+        waveform_tensor = resampler(waveform_tensor)
+    
+    # 轉換為 numpy array
+    audio_array = waveform_tensor.squeeze().numpy()
+    
+    return audio_array
+
+def process_audio_bytes_ffmpeg(audio_path: str) -> bytes:
+    """
+    使用 ffmpeg 處理音頻（備用方案）
+    
+    Args:
+        audio_path: 臨時音頻文件路徑
+    
+    Returns:
+        PCM audio bytes (16kHz, mono, s16le)
+    """
+    audio_bytes, _ = (
+        ffmpeg.input(audio_path, threads=0)
+        .output("-", format="s16le", acodec="pcm_s16le", ac=1, ar=16000)
+        .run(cmd=["ffmpeg", "-nostdin"], capture_stdout=True, capture_stderr=True)
+    )
+    return audio_bytes
+
+def llm_correction(text: str) -> str:
+    """
+    使用 LLM 進行文本校正
+    
+    Args:
+        text: 需要校正的文本
+    
+    Returns:
+        校正後的文本
+    """
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL"),
+            messages=[
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Error in llm_correction: {e}")
+        return text
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -82,6 +168,7 @@ parser.add_argument(
 parser.add_argument("--certfile", type=str, default=None, required=False, help="certfile for ssl")
 parser.add_argument("--keyfile", type=str, default=None, required=False, help="keyfile for ssl")
 parser.add_argument("--temp_dir", type=str, default="temp_dir/", required=False, help="temp dir")
+parser.add_argument("--llm_correct", action="store_true", help="enable llm correction")
 args = parser.parse_args()
 
 # Resolve device
@@ -126,6 +213,39 @@ model = AutoModel(
 )
 logger.info("loaded models!")
 
+client = None
+LLM_SYSTEM_PROMPT = None
+if args.llm_correct:
+    from openai import OpenAI
+    from dotenv import load_dotenv
+    env_path = Path.cwd() / ".env"
+    load_dotenv(dotenv_path=env_path)
+    client = OpenAI(base_url=os.getenv("OPENAI_BASE_URL"), api_key=os.getenv("OPENAI_API_KEY"))
+    
+    # 讀取 LLM 系統提示
+    prompt_file = Path.cwd() / "prompts" / "llm_correction_system.txt"
+    try:
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            LLM_SYSTEM_PROMPT = f.read()
+        logger.info(f"已從 {prompt_file} 載入 LLM 系統提示")
+    except Exception as e:
+        logger.error(f"無法讀取 LLM 系統提示文件 {prompt_file}: {e}")
+        logger.error("將使用預設的系統提示")
+        LLM_SYSTEM_PROMPT = """
+You are an expert editor designed to post-process ASR (Automatic Speech Recognition) transcripts. 
+
+Your task is to correct the provided text while strictly adhering to the following rules:
+
+1. **Fix Errors:** Correct spelling, grammar, and punctuation mistakes.
+2. **Contextual Correction:** Fix obvious phonetic mistranscriptions (homophones) based on the context.
+3. **Formatting:** Restore proper capitalization for sentences and proper nouns.
+4. **Preserve Meaning:** Do NOT change the original meaning, tone, or style of the speaker. Do NOT summarize or hallucinate information.
+5. **Output Constraint:** Output ONLY the corrected text. Do not include any conversational fillers, introductions, or explanations (e.g., do not say "Here is the corrected text").
+6. **Language:** Follow the original language of the transcript.
+        """
+    
+    logger.info("2 Pass mode enable!")
+
 app = FastAPI(title="FunASR")
 
 param_dict = {
@@ -133,6 +253,7 @@ param_dict = {
     "use_itn": args.use_itn,
     "merge_vad": args.merge_vad,
     "merge_length_s": args.merge_length_s,
+    "output_dir": None,
 }
 
 
@@ -202,22 +323,38 @@ def format_transcription_response(
 
 @app.post("/recognition")
 async def api_recognition(audio: UploadFile = File(..., description="audio file")):
-    suffix = audio.filename.split(".")[-1]
-    audio_path = f"{args.temp_dir}/{str(uuid.uuid1())}.{suffix}"
-    async with aiofiles.open(audio_path, "wb") as out_file:
-        content = await audio.read()
-        await out_file.write(content)
+    # 讀取上傳的文件到記憶體
+    content = await audio.read()
+    
+    # 優先嘗試使用 torchaudio（記憶體處理）
     try:
-        audio_bytes, _ = (
-            ffmpeg.input(audio_path, threads=0)
-            .output("-", format="s16le", acodec="pcm_s16le", ac=1, ar=16000)
-            .run(cmd=["ffmpeg", "-nostdin"], capture_stdout=True, capture_stderr=True)
-        )
-    except Exception as e:
-        logger.error(f"读取音频文件发生错误，错误信息：{e}")
-        return {"msg": "读取音频文件发生错误", "code": 1}
-    rec_results = model.generate(input=audio_bytes, is_final=True, **param_dict)
-
+        logger.info("使用 torchaudio 處理音頻...")
+        audio_array = process_audio_bytes_torchaudio(content)
+        rec_results = model.generate(input=audio_array, is_final=True, **param_dict)
+        
+    except Exception as torchaudio_error:
+        # 如果 torchaudio 失敗，回退到 ffmpeg
+        logger.warning(f"torchaudio 處理失敗：{torchaudio_error}，回退到 ffmpeg")
+        
+        try:
+            # 保存臨時文件供 ffmpeg 使用
+            suffix = audio.filename.split(".")[-1]
+            audio_path = f"{args.temp_dir}/{str(uuid.uuid1())}.{suffix}"
+            async with aiofiles.open(audio_path, "wb") as out_file:
+                await out_file.write(content)
+            
+            audio_bytes = process_audio_bytes_ffmpeg(audio_path)
+            rec_results = model.generate(input=audio_bytes, is_final=True, **param_dict)
+            
+            # 清理臨時文件
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+                
+        except Exception as e:
+            logger.error(f"读取音频文件发生错误，错误信息：{e}")
+            return {"msg": "读取音频文件发生错误", "code": 1}
+    
+    # 檢查結果
     if not rec_results or len(rec_results) == 0:
         return {"text": "", "code": 0}
 
@@ -231,11 +368,12 @@ async def api_recognition(audio: UploadFile = File(..., description="audio file"
     return ret
 
 
+
 @app.post("/v1/audio/transcriptions")
 @app.post("/audio/transcriptions")  # Alias route
 async def openai_transcriptions(
     file: UploadFile = File(..., description="audio file"),
-    model_name: str = Form(..., alias="model", description="model to use"),
+    model_name: Optional[str] = Form("sensevoice", alias="model", description="model to use"),
     language: Optional[str] = Form(None, description="language code (ISO-639-1)"),
     prompt: Optional[str] = Form(None, description="optional prompt"),
     response_format: Optional[str] = Form("json", description="response format"),
@@ -245,37 +383,49 @@ async def openai_transcriptions(
     OpenAI-compatible audio transcription endpoint
     Also available at /audio/transcriptions (alias)
     """
-    suffix = file.filename.split(".")[-1] if "." in file.filename else "wav"
-    audio_path = f"{args.temp_dir}/{str(uuid.uuid1())}.{suffix}"
-    async with aiofiles.open(audio_path, "wb") as out_file:
-        content = await file.read()
-        await out_file.write(content)
-
-    try:
-        audio_bytes, _ = (
-            ffmpeg.input(audio_path, threads=0)
-            .output("-", format="s16le", acodec="pcm_s16le", ac=1, ar=16000)
-            .run(cmd=["ffmpeg", "-nostdin"], capture_stdout=True, capture_stderr=True)
-        )
-    except Exception as e:
-        logger.error(f"音頻文件處理錯誤：{e}")
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        return {"error": {"message": "Audio file processing failed", "type": "invalid_request_error"}}
-
+    # 讀取上傳的文件到記憶體
+    content = await file.read()
+    
+    # 準備推理參數
     inference_params = {
         "language": language or args.language,
         "use_itn": args.use_itn,
         "merge_vad": args.merge_vad,
         "merge_length_s": args.merge_length_s,
+        "output_dir": None,
     }
-
+    
+    # 優先嘗試使用 torchaudio（記憶體處理）
     try:
-        rec_results = model.generate(input=audio_bytes, is_final=True, **inference_params)
-
-        if not rec_results or len(rec_results) == 0:
+        logger.info("使用 torchaudio 處理音頻...")
+        audio_array = process_audio_bytes_torchaudio(content)
+        rec_results = model.generate(input=audio_array, is_final=True, **inference_params)
+        
+    except Exception as torchaudio_error:
+        # 如果 torchaudio 失敗，回退到 ffmpeg
+        logger.warning(f"torchaudio 處理失敗：{torchaudio_error}，回退到 ffmpeg")
+        
+        try:
+            # 保存臨時文件供 ffmpeg 使用
+            suffix = file.filename.split(".")[-1] if "." in file.filename else "wav"
+            audio_path = f"{args.temp_dir}/{str(uuid.uuid1())}.{suffix}"
+            async with aiofiles.open(audio_path, "wb") as out_file:
+                await out_file.write(content)
+            
+            audio_bytes = process_audio_bytes_ffmpeg(audio_path)
+            rec_results = model.generate(input=audio_bytes, is_final=True, **inference_params)
+            
+            # 清理臨時文件
             if os.path.exists(audio_path):
                 os.remove(audio_path)
+                
+        except Exception as e:
+            logger.error(f"音頻文件處理錯誤：{e}")
+            return {"error": {"message": "Audio file processing failed", "type": "invalid_request_error"}}
+    
+    # 執行辨識
+    try:
+        if not rec_results or len(rec_results) == 0:
             formatted_response = format_transcription_response("", response_format, language=language)
             if response_format in ["text", "srt", "vtt"]:
                 return Response(content=formatted_response, media_type="text/plain")
@@ -283,18 +433,16 @@ async def openai_transcriptions(
 
         rec_result = rec_results[0]
         if "text" not in rec_result or len(rec_result["text"]) == 0:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
             formatted_response = format_transcription_response("", response_format, language=language)
             if response_format in ["text", "srt", "vtt"]:
                 return Response(content=formatted_response, media_type="text/plain")
             return formatted_response
 
         text = rich_transcription_postprocess(rec_result["text"])
-
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
+        if args.llm_correct:
+            text = llm_correction(text)
+        
+        # 格式化回應
         formatted_response = format_transcription_response(
             text=text,
             response_format=response_format,
@@ -312,10 +460,7 @@ async def openai_transcriptions(
 
     except Exception as e:
         logger.error(f"辨識過程發生錯誤：{e}")
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
         return {"error": {"message": str(e), "type": "server_error"}}
-
 
 if __name__ == "__main__":
     uvicorn.run(

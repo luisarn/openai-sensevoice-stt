@@ -40,7 +40,7 @@ def get_audio_duration(audio_file: str) -> float:
 
 def test_transcription_speed(
     audio_file: str,
-    api_url: str = "http://localhost:8000/v1/audio/transcriptions",
+    api_url: str = "http://localhost:8200/v1/audio/transcriptions",
     model: str = "sensevoice",
     response_format: str = "json",
     language: str = None,
@@ -171,8 +171,8 @@ def main():
     parser.add_argument(
         "--url",
         type=str,
-        default="http://localhost:8000/v1/audio/transcriptions",
-        help="API endpoint URL (default: http://localhost:8000/v1/audio/transcriptions)"
+        default="http://localhost:8200/v1/audio/transcriptions",
+        help="API endpoint URL (default: http://localhost:8200/v1/audio/transcriptions)"
     )
     parser.add_argument(
         "--model",

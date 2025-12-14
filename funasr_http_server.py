@@ -109,7 +109,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--host", type=str, default="0.0.0.0", required=False, help="host ip, localhost, 0.0.0.0"
 )
-parser.add_argument("--port", type=int, default=8200, required=False, help="server port")
+parser.add_argument("--port", type=int, default=8000, required=False, help="server port")
 parser.add_argument(
     "--model_dir",
     type=str,
@@ -134,12 +134,7 @@ parser.add_argument(
     default=30000,
     help="max_single_segment_time for VAD in milliseconds",
 )
-parser.add_argument(
-    "--device",
-    type=str,
-    default="auto",
-    help="Device to use: 'cuda', 'cpu', 'mps', or 'auto' (default: auto)",
-)
+parser.add_argument("--device", type=str, default="cpu", help="cuda or cpu")
 parser.add_argument("--ncpu", type=int, default=4, help="cpu cores")
 parser.add_argument(
     "--language",
@@ -170,35 +165,15 @@ parser.add_argument("--keyfile", type=str, default=None, required=False, help="k
 parser.add_argument("--temp_dir", type=str, default="temp_dir/", required=False, help="temp dir")
 parser.add_argument("--llm_correct", action="store_true", help="enable llm correction")
 args = parser.parse_args()
-
-# Resolve device
-if args.device == "auto":
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
-else:
-    device = args.device
-
-# Validate MPS availability
-if device == "mps" and not torch.backends.mps.is_available():
-    logger.warning("MPS requested but not available. Falling back to CPU.")
-    device = "cpu"
-
 logger.info("-----------  Configuration Arguments -----------")
 for arg, value in vars(args).items():
-    if arg == "device":
-        logger.info(f"device: {device} (requested: {args.device})")
-    else:
-        logger.info("%s: %s" % (arg, value))
+    logger.info("%s: %s" % (arg, value))
 logger.info("------------------------------------------------")
 
 os.makedirs(args.temp_dir, exist_ok=True)
 
 logger.info("model loading")
-# Load SenseVoice model
+# load SenseVoice model
 model_dir = args.model_dir
 model = AutoModel(
     model=model_dir,
@@ -206,7 +181,7 @@ model = AutoModel(
     remote_code=args.remote_code,
     vad_model=args.vad_model,
     vad_kwargs={"max_single_segment_time": args.vad_kwargs},
-    device=device,
+    device=args.device,
     ncpu=args.ncpu,
     disable_pbar=True,
     disable_log=True,
@@ -301,6 +276,15 @@ def format_transcription_response(
 ):
     """
     將辨識結果格式化為指定的回應格式
+    
+    Args:
+        text: 辨識文本
+        response_format: 回應格式 (json, text, verbose_json, srt, vtt)
+        duration: 音頻時長（秒）
+        language: 檢測到的語言
+    
+    Returns:
+        格式化後的回應
     """
     if response_format == "text":
         return text
@@ -318,7 +302,9 @@ def format_transcription_response(
     elif response_format == "vtt":
         return format_vtt(text, duration)
     else:
+        # 預設返回 json
         return {"text": text}
+
 
 
 @app.post("/recognition")
@@ -357,12 +343,15 @@ async def api_recognition(audio: UploadFile = File(..., description="audio file"
     # 檢查結果
     if not rec_results or len(rec_results) == 0:
         return {"text": "", "code": 0}
-
+    
     rec_result = rec_results[0]
     if "text" not in rec_result or len(rec_result["text"]) == 0:
         return {"text": "", "code": 0}
-
+    
+    # 使用 rich_transcription_postprocess 處理結果
     text = rich_transcription_postprocess(rec_result["text"])
+    
+    # 簡化的回應格式
     ret = {"text": text, "code": 0}
     logger.info(f"識別結果：{ret}")
     return ret
@@ -370,7 +359,6 @@ async def api_recognition(audio: UploadFile = File(..., description="audio file"
 
 
 @app.post("/v1/audio/transcriptions")
-@app.post("/audio/transcriptions")  # Alias route
 async def openai_transcriptions(
     file: UploadFile = File(..., description="audio file"),
     model_name: Optional[str] = Form("sensevoice", alias="model", description="model to use"),
@@ -381,7 +369,9 @@ async def openai_transcriptions(
 ):
     """
     OpenAI-compatible audio transcription endpoint
-    Also available at /audio/transcriptions (alias)
+    
+    Compatible with OpenAI's /v1/audio/transcriptions API
+    Supports response formats: json, text, verbose_json, srt, vtt
     """
     # 讀取上傳的文件到記憶體
     content = await file.read()
@@ -430,14 +420,15 @@ async def openai_transcriptions(
             if response_format in ["text", "srt", "vtt"]:
                 return Response(content=formatted_response, media_type="text/plain")
             return formatted_response
-
+        
         rec_result = rec_results[0]
         if "text" not in rec_result or len(rec_result["text"]) == 0:
             formatted_response = format_transcription_response("", response_format, language=language)
             if response_format in ["text", "srt", "vtt"]:
                 return Response(content=formatted_response, media_type="text/plain")
             return formatted_response
-
+        
+        # 後處理文本
         text = rich_transcription_postprocess(rec_result["text"])
         if args.llm_correct:
             text = llm_correction(text)
@@ -448,16 +439,17 @@ async def openai_transcriptions(
             response_format=response_format,
             language=language
         )
-
+        
         logger.info(f"OpenAI API 辨識結果：{text[:100]}...")
-
+        
+        # 根據回應格式設定 Content-Type
         if response_format == "text":
             return Response(content=formatted_response, media_type="text/plain")
         elif response_format in ["srt", "vtt"]:
             return Response(content=formatted_response, media_type="text/plain")
         else:
             return formatted_response
-
+            
     except Exception as e:
         logger.error(f"辨識過程發生錯誤：{e}")
         return {"error": {"message": str(e), "type": "server_error"}}
